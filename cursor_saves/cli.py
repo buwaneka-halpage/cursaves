@@ -662,7 +662,12 @@ def _find_ahead_conversations(
     return ahead_items
 
 
-def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBackend] = None) -> int:
+def _export_and_push(
+    sync_dir: Path,
+    items: list[dict],
+    backend: Optional[SyncBackend] = None,
+    fail_on_push_error: bool = False,
+) -> int:
     """Export a list of ahead conversation items and push via the backend.
 
     Returns the number of conversations successfully exported.
@@ -700,6 +705,8 @@ def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBa
             print(" done")
         else:
             print(" failed", file=sys.stderr)
+            if fail_on_push_error:
+                raise RuntimeError("backend push failed")
 
     return total_saved
 
@@ -711,6 +718,7 @@ def _push_ahead(
     target_project_path: Optional[str] = None,
     target_workspace_dir: Optional[Path] = None,
     include_never_pushed: bool = False,
+    fail_on_push_error: bool = False,
 ) -> int:
     """Find conversations ahead of snapshots and push them.
 
@@ -754,7 +762,12 @@ def _push_ahead(
             if len(name) > 40:
                 name = name[:37] + "..."
             print(f"    {name} [{item['workspace_label']}]")
-        total = _export_and_push(sync_dir, ahead_items, backend=backend)
+        total = _export_and_push(
+            sync_dir,
+            ahead_items,
+            backend=backend,
+            fail_on_push_error=fail_on_push_error,
+        )
         if total == 0:
             print(
                 "  Warning: 0 conversation(s) exported. If chats exist in Cursor, "
@@ -1299,6 +1312,29 @@ def cmd_watch(args):
     )
 
 
+def cmd_autosave(args):
+    """Handle a Cursor stop event or run the detached autosave worker."""
+    from . import autosave
+
+    if args.hook:
+        autosave.handle_hook()
+        print("{}")
+    elif args.worker:
+        autosave.run_worker()
+
+
+def cmd_hooks_install(args):
+    """Install the user-level Cursor autosave stop hook."""
+    from .autosave import install_hook
+
+    try:
+        path, changed = install_hook()
+    except Exception as exc:
+        print(f"Could not install hook: {exc}", file=sys.stderr)
+        return
+    print(f"{'Installed' if changed else 'Already installed'} autosave hook in {path}")
+
+
 def cmd_copy(args):
     """Copy conversations between workspaces on the same machine."""
     # Select source workspace
@@ -1616,6 +1652,18 @@ def cmd_doctor(args):
         f"  Empty stubs:         {audit['empty']}\n"
     )
 
+    header_store = audit.get("header_store", {})
+    header_drift = sum(
+        len(header_store.get(key, []))
+        for key in ("legacy_only", "typed_only", "mismatched")
+    )
+    duplicate_workspaces = audit.get("duplicate_workspaces", [])
+    if header_store.get("typed_supported") or duplicate_workspaces:
+        print(
+            f"  Header-store drift:  {header_drift}\n"
+            f"  Duplicate workspaces:{len(duplicate_workspaces):>3}\n"
+        )
+
     if audit["workspaces"]:
         print(
             "  ─── Workspaces with chats ───────────────────────────────────\n"
@@ -1627,6 +1675,8 @@ def cmd_doctor(args):
     orphaned = audit["orphaned"]
     if not orphaned:
         print("  No orphaned chats found.\n")
+        if args.recover and (header_drift or duplicate_workspaces):
+            doctor_recover(force=getattr(args, "force", False))
         return
 
     print(
@@ -1993,6 +2043,24 @@ def main():
     )
     p_watch.add_argument("--verbose", "-v", action="store_true", help="Print on every check")
     p_watch.set_defaults(func=cmd_watch)
+
+    # ── autosave / hooks ───────────────────────────────────────────────
+    p_autosave = subparsers.add_parser(
+        "autosave", help="Schedule a push-only autosave"
+    )
+    autosave_mode = p_autosave.add_mutually_exclusive_group(required=True)
+    autosave_mode.add_argument(
+        "--hook", action="store_true", help="Handle a Cursor stop hook"
+    )
+    autosave_mode.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    p_autosave.set_defaults(func=cmd_autosave)
+
+    p_hooks = subparsers.add_parser("hooks", help="Manage Cursor hooks")
+    hooks_subparsers = p_hooks.add_subparsers(dest="hooks_command", required=True)
+    p_hooks_install = hooks_subparsers.add_parser(
+        "install", help="Install the autosave stop hook"
+    )
+    p_hooks_install.set_defaults(func=cmd_hooks_install)
 
     # ── doctor ─────────────────────────────────────────────────────
     p_doctor = subparsers.add_parser(
